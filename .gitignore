@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+*.egg-info/
+
+# Локальные артефакты разработки
+.tmp/
+vidgrab/assets/ffmpeg.exe
+tools/*.zip
+tools/ffmpeg-*/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Собранные Windows-бинарники (см. README: скачиваются скриптом)
+*.exe
+!tools/**/*.exe
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Dev-артефакты скриптов
+tools/*.log
+tools/*.pid
+tools/ffmpeg-cache/

@@ -1,0 +1,45 @@
+# Сборка Windows-exe в Linux/Docker через Wine + Windows Python.
+# Нужен только Docker; Windows-хост не требуется.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    WINEPREFIX=/wine \
+    WINEARCH=win64 \
+    WINEDEBUG=-all \
+    WINEDLLOVERRIDES=mscoree,mshtml= \
+    DISPLAY=:0
+
+RUN dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        wine \
+        wine64 \
+        wine32:i386 \
+        xvfb \
+        xauth \
+        wget \
+        ca-certificates \
+        unzip \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Windows Python 3.11 (тихая установка в C:\Python311).
+RUN wget -q -O /tmp/python-setup.exe \
+        https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe \
+    && xvfb-run -a wine /tmp/python-setup.exe /quiet InstallAllUsers=1 PrependPath=1 \
+        Include_test=0 Include_launcher=0 TargetDir=C:\\Python311 \
+    && rm -f /tmp/python-setup.exe \
+    && xvfb-run -a wine C:\\Python311\\python.exe --version
+
+# Чтобы сбой wine не вешал сборку в отладчике.
+RUN xvfb-run -a wine reg add 'HKCU\\Software\\Wine\\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f || true
+
+COPY requirements.txt /tmp/requirements.txt
+RUN xvfb-run -a wine C:\\Python311\\python.exe -m pip install --no-warn-script-location \
+        --upgrade pip setuptools wheel \
+    && xvfb-run -a wine C:\\Python311\\python.exe -m pip install --no-warn-script-location \
+        -r Z:/tmp/requirements.txt \
+    && xvfb-run -a wine C:\\Python311\\python.exe -m pip cache purge
+
+WORKDIR /src
