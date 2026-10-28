@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, QSize, Qt
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QComboBox,
@@ -26,6 +26,16 @@ from PySide6.QtWidgets import (
 from vidgrab import APP_NAME, APP_VERSION, strings
 from vidgrab.downloader import DownloadWorker, MetadataWorker
 from vidgrab.settings import Settings, save_settings
+from vidgrab.theme import (
+    ERROR,
+    NORMAL,
+    SUCCESS,
+    VidGrabComboBox,
+    apply_theme,
+    enable_dark_title_bar,
+    make_app_icon,
+    make_icon,
+)
 from vidgrab.utils import (
     ensure_writable_dir,
     find_ffmpeg,
@@ -58,6 +68,7 @@ class MainWindow(QMainWindow):
         self._download_factory: DownloadFactory = download_factory or (
             lambda url, quality, outdir, ffmpeg: DownloadWorker(url, quality, outdir, ffmpeg)
         )
+        self._titlebar_styled = False
         self._metadata_worker: Any = None
         self._download_worker: Any = None
         self._metadata: dict[str, Any] | None = None
@@ -65,30 +76,41 @@ class MainWindow(QMainWindow):
         self._last_path: Path | None = None
         self._busy: str | None = None
 
+        apply_theme()
         self.setWindowTitle(strings.WINDOW_TITLE)
-        self.setMinimumSize(720, 480)
+        self.setWindowIcon(make_app_icon())
+        self.setMinimumSize(900, 620)
+        self.resize(1040, 720)
         self._build_ui()
         self._restore_window_geometry()
         self._apply_settings()
         self._set_busy(None)
+        self._set_status(strings.STATUS_IDLE)
         log.info("Окно VidGrab создано, папка по умолчанию: %s", self.settings.last_folder)
 
     # ---------- построение интерфейса ----------
 
     def _build_ui(self) -> None:
         central = QWidget(self)
+        central.setObjectName("centralWidget")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(28, 24, 28, 18)
+        layout.setSpacing(18)
 
+        # Ссылка.
         url_row = QHBoxLayout()
+        url_row.setSpacing(10)
         url_label = QLabel(strings.LABEL_URL)
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText(strings.PLACEHOLDER_URL)
         self.url_edit.setClearButtonEnabled(True)
+        self.url_edit.setMinimumHeight(44)
         self.paste_btn = QPushButton(strings.BTN_PASTE)
+        self.paste_btn.setMinimumHeight(44)
         self.check_btn = QPushButton(strings.BTN_CHECK)
+        self.check_btn.setObjectName("accentButton")
+        self.check_btn.setMinimumHeight(44)
         self.check_btn.setDefault(True)
         url_row.addWidget(url_label)
         url_row.addWidget(self.url_edit, 1)
@@ -96,48 +118,71 @@ class MainWindow(QMainWindow):
         url_row.addWidget(self.check_btn)
         layout.addLayout(url_row)
 
+        # Метаданные.
         info_frame = QFrame()
-        info_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        info_frame.setObjectName("infoPanel")
         info_layout = QVBoxLayout(info_frame)
-        info_layout.setContentsMargins(10, 8, 10, 8)
-        info_layout.setSpacing(4)
+        info_layout.setContentsMargins(20, 16, 20, 16)
+        info_layout.setSpacing(8)
+
         title_row = QHBoxLayout()
-        title_row.addWidget(QLabel(strings.LABEL_TITLE))
+        title_caption = QLabel(strings.LABEL_TITLE)
+        title_caption.setObjectName("captionLabel")
+        title_row.addWidget(title_caption)
         self.title_value = QLabel(strings.PLACEHOLDER_TITLE)
+        self.title_value.setObjectName("titleValue")
         self.title_value.setWordWrap(True)
         self.title_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         title_row.addWidget(self.title_value, 1)
         info_layout.addLayout(title_row)
+
         duration_row = QHBoxLayout()
-        duration_row.addWidget(QLabel(strings.LABEL_DURATION))
+        duration_caption = QLabel(strings.LABEL_DURATION)
+        duration_caption.setObjectName("captionLabel")
+        duration_row.addWidget(duration_caption)
         self.duration_value = QLabel(strings.PLACEHOLDER_DURATION)
         duration_row.addWidget(self.duration_value, 1)
         info_layout.addLayout(duration_row)
         layout.addWidget(info_frame)
 
+        # Качество.
         quality_row = QHBoxLayout()
+        quality_row.setSpacing(12)
         quality_row.addWidget(QLabel(strings.LABEL_QUALITY))
-        self.quality_combo = QComboBox()
-        self.quality_combo.setMinimumWidth(220)
+        self.quality_combo = VidGrabComboBox()
+        self.quality_combo.setMinimumSize(QSize(320, 42))
+        self.quality_combo.setMaximumWidth(520)
         quality_row.addWidget(self.quality_combo)
         quality_row.addStretch(1)
         layout.addLayout(quality_row)
 
+        # Папка.
         folder_row = QHBoxLayout()
+        folder_row.setSpacing(10)
         folder_row.addWidget(QLabel(strings.LABEL_FOLDER))
         self.folder_edit = QLineEdit()
         self.folder_edit.setPlaceholderText(str(Path.home() / "Downloads" / APP_NAME))
+        self.folder_edit.setMinimumHeight(42)
         self.browse_btn = QPushButton(strings.BTN_BROWSE)
+        self.browse_btn.setMinimumHeight(42)
         folder_row.addWidget(self.folder_edit, 1)
         folder_row.addWidget(self.browse_btn)
         layout.addLayout(folder_row)
 
+        # Кнопки действий.
         actions_row = QHBoxLayout()
+        actions_row.setSpacing(12)
         self.download_btn = QPushButton(strings.BTN_DOWNLOAD)
-        self.download_btn.setMinimumWidth(140)
+        self.download_btn.setObjectName("primaryButton")
+        self.download_btn.setIcon(make_icon("download", "#ffffff"))
+        self.download_btn.setIconSize(QSize(18, 18))
+        self.download_btn.setMinimumSize(QSize(160, 46))
         self.cancel_btn = QPushButton(strings.BTN_CANCEL)
-        self.cancel_btn.setMinimumWidth(120)
+        self.cancel_btn.setMinimumSize(QSize(130, 46))
         self.open_folder_btn = QPushButton(strings.BTN_OPEN_FOLDER)
+        self.open_folder_btn.setIcon(make_icon("folder", "#e8ebf3"))
+        self.open_folder_btn.setIconSize(QSize(18, 18))
+        self.open_folder_btn.setMinimumSize(QSize(190, 46))
         self.open_folder_btn.setVisible(False)
         actions_row.addWidget(self.download_btn)
         actions_row.addWidget(self.cancel_btn)
@@ -145,12 +190,16 @@ class MainWindow(QMainWindow):
         actions_row.addStretch(1)
         layout.addLayout(actions_row)
 
+        # Прогресс.
         progress_row = QHBoxLayout()
+        progress_row.setSpacing(12)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(8)
         self.percent_label = QLabel("0%")
+        self.percent_label.setObjectName("percentLabel")
         self.percent_label.setMinimumWidth(40)
         self.percent_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         progress_row.addWidget(self.progress_bar, 1)
@@ -158,24 +207,32 @@ class MainWindow(QMainWindow):
         layout.addLayout(progress_row)
 
         details_row = QHBoxLayout()
+        details_row.setSpacing(28)
         self.speed_label = QLabel(strings.PLACEHOLDER_SPEED)
+        self.speed_label.setObjectName("mutedLabel")
         self.eta_label = QLabel(strings.PLACEHOLDER_ETA)
+        self.eta_label.setObjectName("mutedLabel")
         details_row.addWidget(self.speed_label)
-        details_row.addSpacing(24)
         details_row.addWidget(self.eta_label)
         details_row.addStretch(1)
         layout.addLayout(details_row)
 
         self.status_label = QLabel(strings.STATUS_IDLE)
+        self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status_label)
 
         layout.addStretch(1)
 
+        separator = QFrame()
+        separator.setObjectName("separator")
+        separator.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(separator)
+
         disclaimer = QLabel(strings.DISCLAIMER)
+        disclaimer.setObjectName("disclaimerLabel")
         disclaimer.setWordWrap(True)
-        disclaimer.setStyleSheet("color: #666666; font-size: 11px;")
         layout.addWidget(disclaimer)
 
         # Сигналы.
@@ -187,6 +244,12 @@ class MainWindow(QMainWindow):
         self.open_folder_btn.clicked.connect(self._on_open_folder)
         self.url_edit.textEdited.connect(self._on_url_edited)
         self.quality_combo.currentTextChanged.connect(self._on_quality_changed)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        if not self._titlebar_styled:
+            enable_dark_title_bar(self)
+            self._titlebar_styled = True
 
     # ---------- настройки и состояние ----------
 
@@ -222,7 +285,7 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
 
     def _set_status(self, text: str, *, error: bool = False, ok: bool = False) -> None:
-        color = "#b00020" if error else ("#1b5e20" if ok else "#333333")
+        color = ERROR if error else (SUCCESS if ok else NORMAL)
         self.status_label.setStyleSheet(f"color: {color};")
         self.status_label.setText(text)
 

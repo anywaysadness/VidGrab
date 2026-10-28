@@ -271,3 +271,12 @@ def test_close_saves_settings(qapp, tmp_path, monkeypatch):
     data = json.loads(saved.read_text(encoding="utf-8"))
     assert data["last_folder"] == str(tmp_path / "chosen")
     assert data["language"] == "ru"
+
+
+def test_theme_and_icons(qapp, tmp_path):
+    window, _ = make_window(tmp_path)
+    assert qapp.styleSheet()
+    assert not window.download_btn.icon().isNull()
+    assert not window.open_folder_btn.icon().isNull()
+    assert window.minimumWidth() >= 900
+    window.close()
