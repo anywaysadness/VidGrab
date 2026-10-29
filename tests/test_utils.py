@@ -122,3 +122,46 @@ def test_find_ffmpeg_env_override(tmp_path, monkeypatch):
     fake.write_bytes(b"")
     monkeypatch.setenv("VIDGRAB_FFMPEG", str(fake))
     assert find_ffmpeg() == fake
+
+
+def test_find_quickjs_env_override(tmp_path, monkeypatch):
+    from vidgrab.utils import find_quickjs
+
+    fake = tmp_path / ("qjs.exe" if sys.platform == "win32" else "qjs")
+    fake.write_bytes(b"")
+    monkeypatch.setenv("VIDGRAB_QJS", str(fake))
+    assert find_quickjs() == fake
+
+
+def test_find_quickjs_ignores_windows_binary_on_posix(monkeypatch):
+    from vidgrab.utils import find_quickjs
+
+    if sys.platform == "win32":
+        pytest.skip("поведение только для POSIX")
+    monkeypatch.delenv("VIDGRAB_QJS", raising=False)
+    found = find_quickjs()
+    assert found is None or found.suffix.lower() != ".exe"
+
+
+def test_open_folder_creates_missing_dir(tmp_path, monkeypatch):
+    from vidgrab import utils
+
+    opened = []
+    monkeypatch.setattr(utils, "_open_path", lambda path: opened.append(Path(path)))
+    target = tmp_path / "new" / "folder"
+    result = utils.open_folder(target)
+    assert result == target
+    assert target.is_dir()
+    assert opened == [target]
+
+
+def test_open_folder_accepts_existing_file_path(tmp_path, monkeypatch):
+    from vidgrab import utils
+
+    opened = []
+    monkeypatch.setattr(utils, "_open_path", lambda path: opened.append(Path(path)))
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x")
+    result = utils.open_folder(video)
+    assert result == tmp_path  # для файла открывается его папка
+    assert opened == [tmp_path]

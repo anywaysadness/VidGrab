@@ -18,6 +18,24 @@ from vidgrab.downloader import (
         (DownloadError("ERROR: This video is private"), "unavailable"),
         (DownloadError("ERROR: Video unavailable"), "unavailable"),
         (DownloadError("ERROR: HTTP Error 404: Not Found"), "unavailable"),
+        (DownloadError("ERROR: Sign in to confirm your age"), "unavailable"),
+        (DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden"), "forbidden"),
+        (
+            DownloadError("ERROR: Sign in to confirm you're not a bot. Use --cookies-from-browser"),
+            "bot_check",
+        ),
+        (
+            DownloadError("ERROR: Requested format is not available"),
+            "format_unavailable",
+        ),
+        (
+            DownloadError("ERROR: This video is DRM protected and cannot be downloaded"),
+            "drm",
+        ),
+        (
+            DownloadError("ERROR: Failed to decrypt with DPAPI (cookie database is locked)"),
+            "cookies",
+        ),
         (
             DownloadError(
                 "ERROR: You have requested merging of multiple formats but ffmpeg is not installed"
@@ -202,3 +220,67 @@ def test_download_worker_permission_error(tmp_path):
     worker.failed.connect(lambda code, message: failures.append((code, message)))
     worker.run()
     assert failures and failures[0][0] == "permission"
+
+
+def test_public_video_errors_do_not_mention_drm():
+    """403 и bot-check на публичном видео не должны выглядеть как DRM."""
+    for exc in (
+        DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden"),
+        DownloadError("ERROR: Sign in to confirm you're not a bot"),
+        DownloadError("ERROR: This video is private"),
+        DownloadError("ERROR: Requested format is not available"),
+    ):
+        _code, message = describe_error(exc)
+        assert "DRM" not in message
+        assert "не обходит" not in message
+        assert "приложение не" not in message.lower()
+
+
+def test_build_ydl_opts_uses_quickjs_and_cookies(tmp_path):
+    from vidgrab.downloader import YdlConfig, build_ydl_opts
+
+    qjs = tmp_path / "qjs.exe"
+    cookies = tmp_path / "cookies.txt"
+    config = YdlConfig(
+        js_runtime=qjs,
+        cookies_from_browser="chrome",
+        youtube_client="web",
+    )
+    opts = build_ydl_opts(tmp_path, "720p", None, config=config)
+    assert opts["js_runtimes"] == {"quickjs": {"path": str(qjs)}}
+    assert opts["cookiesfrombrowser"] == ("chrome",)
+    assert "cookiefile" not in opts
+    assert opts["extractor_args"] == {"youtube": {"player_client": ["web"]}}
+
+    config = YdlConfig(cookies_file=str(cookies))
+    opts = build_ydl_opts(tmp_path, "best", None, config=config)
+    assert opts["cookiefile"] == str(cookies)
+    assert "cookiesfrombrowser" not in opts
+    assert "js_runtimes" not in opts  # без qjs остаётся поведение yt-dlp по умолчанию
+
+
+def test_workers_pass_config_to_ydl(tmp_path):
+    from vidgrab.downloader import YdlConfig
+
+    seen = {}
+
+    class _CaptureYDL:
+        def __init__(self, opts):
+            seen["opts"] = opts
+
+        def extract_info(self, url, download=False):
+            return {
+                "id": "x",
+                "title": "t",
+                "formats": [{"height": 720, "vcodec": "avc1"}],
+            }
+
+        def close(self):
+            pass
+
+    config = YdlConfig(js_runtime=tmp_path / "qjs.exe")
+    worker = MetadataWorker(
+        "https://example.com/v", None, ydl_factory=_CaptureYDL, config=config
+    )
+    worker.run()
+    assert seen["opts"]["js_runtimes"]["quickjs"]["path"] == str(tmp_path / "qjs.exe")

@@ -1,4 +1,4 @@
-﻿# VidGrab build script: creates dist\VidGrab\VidGrab.exe with PyInstaller.
+# VidGrab build script: creates dist\VidGrab\VidGrab.exe with PyInstaller.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File build.ps1
@@ -98,6 +98,17 @@ if (-not (Test-Path $ffmpeg)) {
     if (-not (Test-Path $ffmpeg)) { throw "ffmpeg.exe is missing" }
 }
 
+$qjs = Join-Path $root "vidgrab\assets\qjs.exe"
+if (-not (Test-Path $qjs)) {
+    Write-Host "qjs.exe not found, downloading QuickJS-ng ..."
+    $code = Invoke-Native "powershell" @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $root "tools\fetch_qjs.ps1")
+    )
+    Assert-Success $code "Failed to download qjs"
+    if (-not (Test-Path $qjs)) { throw "qjs.exe is missing" }
+}
+
 if ($Clean) {
     Write-Host "Cleaning build/ and dist/ ..."
     Remove-Item -Recurse -Force (Join-Path $root "build"), (Join-Path $root "dist") -ErrorAction SilentlyContinue
@@ -109,6 +120,7 @@ $argumentList = @(
     "--onedir",
     "--name", "VidGrab",
     "--add-binary", "$ffmpeg;vidgrab/assets",
+    "--add-binary", "$qjs;vidgrab/assets",
     "--collect-submodules", "yt_dlp",
     "--collect-data", "yt_dlp",
     "--paths", ".",

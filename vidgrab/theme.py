@@ -156,6 +156,25 @@ QFrame#infoPanel QLabel {
 QFrame#infoPanel QLabel#captionLabel {
     color: #98a0b3;
 }
+QFrame#resultPanel {
+    background-color: #1e2a22;
+    border: 1px solid #2f4a38;
+    border-radius: 10px;
+}
+QLabel#resultLabel {
+    color: #d7f5e1;
+}
+QLabel#resultLink {
+    color: #8bb8ff;
+    font-weight: 600;
+}
+QLabel#hintLabel {
+    color: #98a0b3;
+    font-size: 9pt;
+}
+QMessageBox {
+    background-color: #1b1d24;
+}
 QFrame#separator {
     background-color: #2a2e39;
     border: none;

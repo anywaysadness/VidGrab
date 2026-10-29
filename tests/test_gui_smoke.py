@@ -90,20 +90,24 @@ def message_boxes(monkeypatch):
     return calls
 
 
-def make_window(tmp_path, summary=SUMMARY, metadata_error=None, download=None):
+def make_window(
+    tmp_path, summary=SUMMARY, metadata_error=None, download=None, download_error=None
+):
     settings = Settings(last_folder=str(tmp_path), last_quality="720p")
     created = {}
 
-    def metadata_factory(url, ffmpeg):
+    def metadata_factory(url, ffmpeg, config):
+        created["metadata_config"] = config
         worker = FakeMetadataWorker(summary if metadata_error is None else None, metadata_error)
         created["metadata"] = worker
         return worker
 
-    def download_factory(url, quality, outdir, ffmpeg):
+    def download_factory(url, quality, outdir, ffmpeg, config):
         created["download_args"] = (url, quality, str(outdir), ffmpeg)
+        created["download_config"] = config
         worker = FakeDownloadWorker(
             path=download or (Path(outdir) / "video.mp4"),
-            error=None,
+            error=download_error,
             auto=True,
         )
         created["download"] = worker
@@ -184,7 +188,7 @@ def test_download_flow(qapp, tmp_path, monkeypatch):
     window, created = make_window(tmp_path, download=target)
     monkeypatch.setattr("vidgrab.ui.find_ffmpeg", lambda: Path("/fake/ffmpeg.exe"))
     opened = []
-    monkeypatch.setattr("vidgrab.ui.open_in_explorer", lambda path: opened.append(path))
+    monkeypatch.setattr("vidgrab.ui.open_folder", lambda path: opened.append(Path(path)) or Path(path))
 
     window.url_edit.setText("https://example.com/video")
     window._on_check()
@@ -197,15 +201,25 @@ def test_download_flow(qapp, tmp_path, monkeypatch):
     assert quality == "720p"
     assert outdir == str(output)
     assert ffmpeg == Path("/fake/ffmpeg.exe")
+    assert created["download_config"] is not None
     assert window.progress_bar.value() == 100
     assert window.open_folder_btn.isVisible()
+    assert window.open_folder_btn.isEnabled()
+    assert window.result_frame.isVisible()
+    assert target.name in window.result_label.text()
+    assert window._last_path == target
     assert "Готово" in window.status_label.text()
     assert window.settings.last_folder == str(output)
 
     window.grab().save(str(tmp_path / "gui_done.png"))
 
+    # Кнопка «Открыть папку» ведёт в папку из поля, а не к файлу.
     window._on_open_folder()
-    assert opened == [target]
+    assert opened[-1] == output
+
+    # Клик по ссылке результата тоже открывает папку.
+    window._on_result_link()
+    assert opened[-1] == output
     window.close()
 
 
@@ -222,7 +236,7 @@ def test_cancel_flow(qapp, tmp_path, monkeypatch):
     window, created = make_window(tmp_path)
     monkeypatch.setattr("vidgrab.ui.find_ffmpeg", lambda: Path("/fake/ffmpeg.exe"))
 
-    def download_factory(url, quality, outdir, ffmpeg):
+    def download_factory(url, quality, outdir, ffmpeg, config):
         worker = FakeDownloadWorker(auto=False)
         created["download"] = worker
         return worker
@@ -239,11 +253,122 @@ def test_cancel_flow(qapp, tmp_path, monkeypatch):
     assert window.status_label.text() == strings.STATUS_CANCELLED
     assert window.cancel_btn.isEnabled() is False
     assert window.download_btn.isEnabled()
+    # После отмены прогресс сброшен, ссылка результата скрыта.
+    assert window.progress_bar.value() == 0
+    assert window.percent_label.text() == "0%"
+    assert window.speed_label.text() == strings.PLACEHOLDER_SPEED
+    assert window.eta_label.text() == strings.PLACEHOLDER_ETA
+    assert not window.result_frame.isVisible()
+    assert window._last_path is None
 
     window.show()
     qapp.processEvents()
     window.grab().save(str(tmp_path / "gui_cancelled.png"))
     window.close()
+
+
+def test_error_resets_progress_and_hides_result(qapp, tmp_path, message_boxes):
+    window, created = make_window(tmp_path, download_error=("forbidden", "HTTP 403"))
+    window.url_edit.setText("https://example.com/video")
+    window._on_check()
+    window._on_download()
+
+    assert message_boxes["critical"]
+    assert window.progress_bar.value() == 0
+    assert window.percent_label.text() == "0%"
+    assert window.speed_label.text() == strings.PLACEHOLDER_SPEED
+    assert window.eta_label.text() == strings.PLACEHOLDER_ETA
+    assert not window.result_frame.isVisible()
+    assert window._last_path is None
+    assert window.status_label.text() == strings.STATUS_ERROR
+    assert window.download_btn.isEnabled()
+    window.close()
+
+
+def test_open_folder_button_works_without_download(qapp, tmp_path, monkeypatch):
+    window, _ = make_window(tmp_path)
+    chosen = tmp_path / "выбранная папка"
+    window.folder_edit.setText(str(chosen))
+    opened = []
+    monkeypatch.setattr("vidgrab.ui.open_folder", lambda path: opened.append(Path(path)) or Path(path))
+
+    window.show()
+    qapp.processEvents()
+    assert window.open_folder_btn.isVisible()
+    assert window.open_folder_btn.isEnabled()
+
+    window._on_open_folder()
+    assert opened == [chosen]
+    window.close()
+
+
+def test_result_link_falls_back_when_file_deleted(qapp, tmp_path, monkeypatch):
+    output = tmp_path / "out"
+    output.mkdir()
+    target = output / "video.mp4"
+    target.write_bytes(b"video")
+
+    window, _ = make_window(tmp_path, download=target)
+    monkeypatch.setattr("vidgrab.ui.find_ffmpeg", lambda: Path("/fake/ffmpeg.exe"))
+    opened = []
+    monkeypatch.setattr("vidgrab.ui.open_folder", lambda path: opened.append(Path(path)) or Path(path))
+
+    window.url_edit.setText("https://example.com/video")
+    window._on_check()
+    window.folder_edit.setText(str(output))
+    window.show()
+    qapp.processEvents()
+    window._on_download()
+    assert window.result_frame.isVisible()
+
+    target.unlink()
+    window._on_result_link()
+    assert opened[-1] == output  # удалённый файл не мешает открыть папку
+    window.close()
+
+
+def test_result_hidden_on_new_check(qapp, tmp_path, monkeypatch):
+    output = tmp_path / "out"
+    output.mkdir()
+    target = output / "video.mp4"
+    target.write_bytes(b"video")
+
+    window, _ = make_window(tmp_path, download=target)
+    monkeypatch.setattr("vidgrab.ui.find_ffmpeg", lambda: Path("/fake/ffmpeg.exe"))
+    window.url_edit.setText("https://example.com/video")
+    window._on_check()
+    window.folder_edit.setText(str(output))
+    window.show()
+    qapp.processEvents()
+    window._on_download()
+    assert window.result_frame.isVisible()
+
+    # Новая ссылка и повторная проверка убирают прошлый результат.
+    window.url_edit.setText("https://example.com/other")
+    window._on_check()
+    assert not window.result_frame.isVisible()
+    assert window._last_path is None
+    window.close()
+
+
+def test_report_button_creates_file(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_APPDATA", str(tmp_path / "appdata"))
+    window, _ = make_window(tmp_path)
+    monkeypatch.setattr(
+        "vidgrab.ui.write_report",
+        lambda settings: _fake_report(tmp_path),
+    )
+    monkeypatch.setattr("vidgrab.ui.QMessageBox.exec", lambda self: 0)
+    window._on_report()
+    assert (tmp_path / "report.txt").is_file()
+    assert strings.STATUS_REPORT_DONE.format(path=tmp_path / "report.txt") in window.status_label.text()
+    window.close()
+
+
+def _fake_report(tmp_path):
+    path = tmp_path / "report.txt"
+    path.write_text("report", encoding="utf-8")
+    return path
 
 
 def test_quality_change_persists_in_settings(qapp, tmp_path):

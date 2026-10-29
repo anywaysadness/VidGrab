@@ -42,6 +42,10 @@ def crash_log_path() -> Path:
     return app_data_dir() / "vidgrab-crash.log"
 
 
+def reports_dir() -> Path:
+    return app_data_dir() / "reports"
+
+
 def default_download_dir() -> Path:
     return Path.home() / "Downloads" / APP_NAME
 
@@ -127,34 +131,74 @@ def truncate(text: str, limit: int = 300) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def find_ffmpeg() -> Path | None:
-    """Ищет ffmpeg: env override → рядом с exe/_MEIPASS → assets пакета → PATH."""
+def _find_binary(env_var: str, names: tuple[str, ...], path_names: tuple[str, ...]) -> Path | None:
+    """Ищет бинарник: env override → рядом с exe/_MEIPASS → assets пакета → PATH."""
     candidates: list[Path] = []
-    env_value = os.environ.get("VIDGRAB_FFMPEG")
+    env_value = os.environ.get(env_var)
     if env_value:
         candidates.append(Path(env_value).expanduser())
 
-    windows = os.name == "nt"
-    binary_name = "ffmpeg.exe" if windows else "ffmpeg"
-
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
-        candidates.append(exe_dir / binary_name)
-        candidates.append(exe_dir / "vidgrab" / "assets" / binary_name)
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            candidates.append(Path(meipass) / binary_name)
-            candidates.append(Path(meipass) / "vidgrab" / "assets" / binary_name)
+        for name in names:
+            candidates.append(exe_dir / name)
+            candidates.append(exe_dir / "vidgrab" / "assets" / name)
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / name)
+                candidates.append(Path(meipass) / "vidgrab" / "assets" / name)
 
     assets_dir = Path(__file__).resolve().parent / "assets"
-    candidates.append(assets_dir / binary_name)
+    for name in names:
+        candidates.append(assets_dir / name)
 
     for candidate in candidates:
         if candidate.is_file():
             return candidate
 
-    found = shutil.which("ffmpeg")
-    return Path(found) if found else None
+    for name in path_names:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
+def find_ffmpeg() -> Path | None:
+    """Ищет ffmpeg: env override → рядом с exe/_MEIPASS → assets пакета → PATH."""
+    if os.name == "nt":
+        names: tuple[str, ...] = ("ffmpeg.exe",)
+        path_names: tuple[str, ...] = ("ffmpeg.exe", "ffmpeg")
+    else:
+        names = ("ffmpeg",)
+        path_names = ("ffmpeg",)
+    return _find_binary("VIDGRAB_FFMPEG", names, path_names)
+
+
+def find_quickjs() -> Path | None:
+    """Ищет JS-рантайм QuickJS (qjs) для yt-dlp: env → exe/_MEIPASS → assets → PATH."""
+    if os.name == "nt":
+        names: tuple[str, ...] = ("qjs.exe",)
+    else:
+        names = ("qjs",)
+    return _find_binary("VIDGRAB_QJS", names, names)
+
+
+def quickjs_version(path: str | Path | None) -> str:
+    """Версия qjs (первая строка вывода) или пустая строка."""
+    if not path:
+        return ""
+    try:
+        proc = subprocess.run(
+            [str(path), "-v"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return output.splitlines()[0] if output else ""
 
 
 def ensure_writable_dir(path: str | Path) -> tuple[bool, str]:
@@ -175,8 +219,16 @@ def ensure_writable_dir(path: str | Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _open_path(path: Path) -> None:
+    if sys.platform == "win32":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    subprocess.Popen([opener, str(path)])
+
+
 def open_in_explorer(path: str | Path) -> None:
-    """Открывает проводник с выделением файла (Windows) или папку."""
+    """Открывает проводник: файл выделяется, папка открывается как папка."""
     target = Path(path).expanduser().resolve()
     folder = target.parent if target.is_file() else target
     if sys.platform == "win32":
@@ -187,6 +239,20 @@ def open_in_explorer(path: str | Path) -> None:
         return
     opener = "open" if sys.platform == "darwin" else "xdg-open"
     subprocess.Popen([opener, str(folder)])
+
+
+def open_folder(path: str | Path) -> Path:
+    """Открывает папку, создавая её при необходимости. Возвращает открытый путь.
+
+    Если передан путь к файлу — открывается его папка. Удалённый файл не мешает:
+    открывается папка, в которой он должен был лежать.
+    """
+    target = Path(path).expanduser()
+    if target.is_file():
+        target = target.parent
+    target.mkdir(parents=True, exist_ok=True)
+    _open_path(target)
+    return target
 
 
 def format_quality_label(quality: str) -> str:

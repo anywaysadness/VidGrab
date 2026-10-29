@@ -17,6 +17,12 @@ log = logging.getLogger(__name__)
 DEFAULT_QUALITY = "best"
 DEFAULT_LANGUAGE = "ru"
 
+# Источники cookies: пусто = не использовать. Значения совпадают с именами
+# браузеров, которые понимает yt-dlp (cookiesfrombrowser).
+COOKIE_BROWSERS = ("", "chrome", "edge", "firefox")
+# Клиент YouTube: пусто = авто (yt-dlp сам выбирает).
+YOUTUBE_CLIENTS = ("", "web", "tv")
+
 
 @dataclass
 class Settings:
@@ -24,6 +30,9 @@ class Settings:
     last_quality: str = DEFAULT_QUALITY
     language: str = DEFAULT_LANGUAGE
     window_geometry: str = ""
+    cookies_from_browser: str = ""
+    cookies_file: str = ""
+    youtube_client: str = ""
 
 
 def _coerce(data: dict[str, Any]) -> Settings:
@@ -40,11 +49,23 @@ def _coerce(data: dict[str, Any]) -> Settings:
     geometry = data.get("window_geometry")
     if not isinstance(geometry, str):
         geometry = ""
+    browser = data.get("cookies_from_browser")
+    if browser not in COOKIE_BROWSERS:
+        browser = ""
+    cookies_file = data.get("cookies_file")
+    if not isinstance(cookies_file, str):
+        cookies_file = ""
+    youtube_client = data.get("youtube_client")
+    if youtube_client not in YOUTUBE_CLIENTS:
+        youtube_client = ""
     return Settings(
         last_folder=folder,
         last_quality=quality,
         language=language,
         window_geometry=geometry,
+        cookies_from_browser=browser,
+        cookies_file=cookies_file,
+        youtube_client=youtube_client,
     )
 
 

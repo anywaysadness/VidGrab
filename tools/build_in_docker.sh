@@ -10,8 +10,13 @@ if [ ! -f "$ROOT/vidgrab/assets/ffmpeg.exe" ]; then
     exit 1
 fi
 
+if [ ! -f "$ROOT/vidgrab/assets/qjs.exe" ]; then
+    echo "Скачиваю qjs.exe ..."
+    bash "$ROOT/tools/fetch_qjs.sh"
+fi
+
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "Собираю Docker-образ $IMAGE (wine + Windows Python 3.12) ..."
+    echo "Собираю Docker-образ $IMAGE (wine + Windows Python 3.11) ..."
     docker build -t "$IMAGE" -f "$ROOT/tools/Dockerfile.wine" "$ROOT"
 fi
 
@@ -25,6 +30,7 @@ docker run --rm -v "$ROOT:/src" -w /src "$IMAGE" \
     wine 'C:\Python311\python.exe' -m PyInstaller \
         --noconfirm --windowed --onedir --name VidGrab \
         --add-binary 'Z:/src/vidgrab/assets/ffmpeg.exe;vidgrab/assets' \
+        --add-binary 'Z:/src/vidgrab/assets/qjs.exe;vidgrab/assets' \
         "${EXTRA_ARGS[@]}" \
         --collect-submodules yt_dlp --collect-data yt_dlp \
         --paths . --distpath dist --workpath build --specpath . \

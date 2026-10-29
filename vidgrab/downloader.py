@@ -6,6 +6,7 @@ import logging
 import re
 import socket
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import URLError
@@ -21,7 +22,60 @@ log = logging.getLogger(__name__)
 OUTTMPL = "%(title).150B [%(id)s].%(ext)s"
 PART_SUFFIXES = (".part", ".ytdl")
 
+
+@dataclass(frozen=True)
+class YdlConfig:
+    """Необязательные параметры yt-dlp: JS-рантайм и авторизация."""
+
+    js_runtime: Path | None = None
+    cookies_from_browser: str = ""
+    cookies_file: str = ""
+    youtube_client: str = ""
+
+    def is_empty(self) -> bool:
+        return not (
+            self.js_runtime
+            or self.cookies_from_browser
+            or self.cookies_file
+            or self.youtube_client
+        )
+
+
 # Ключевые слова в сообщениях yt-dlp, по которым выбираем понятный текст.
+# Порядок проверок важен: bot-check и cookies — до общих сетевых/недоступных.
+_BOT_MARKERS = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you are not a bot",
+    "not a bot",
+    "confirm you're not a bot",
+    "confirm you are not a bot",
+    "botcheck",
+    "bot check",
+)
+_COOKIE_MARKERS = (
+    "cookie database",
+    "cookiesfrombrowser",
+    "cookies from browser",
+    "failed to decrypt",
+    "could not copy chrome cookie",
+    "unable to open cookie",
+    "cookie file",
+    "cookies.txt",
+)
+_DRM_MARKERS = (
+    "widevine",
+    "playready",
+    "drm protected",
+    "drm-protected",
+    "protected by drm",
+    "this video is drm",
+)
+_FORMAT_MARKERS = (
+    "requested format is not available",
+    "no video formats found",
+    "requested format not available",
+    "no formats found",
+)
 _PERMISSION_MARKERS = (
     "permission denied",
     "access is denied",
@@ -46,16 +100,14 @@ _UNAVAILABLE_MARKERS = (
     "this video is unavailable",
     "has been removed",
     "removed by the uploader",
-    "sign in to confirm",
     "members-only",
     "join this channel",
     "not available in your country",
-    "requested format is not available",
-    "http error 403",
-    "http error 404",
     "account has been terminated",
     "age-restricted",
     "confirm your age",
+    "http error 404",
+    "http error 410",
 )
 _NETWORK_MARKERS = (
     "urlopen error",
@@ -142,6 +194,7 @@ def build_ydl_opts(
     logger: logging.Logger | None = None,
     *,
     skip_download: bool = False,
+    config: YdlConfig | None = None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "format": build_format_selector(quality),
@@ -164,6 +217,17 @@ def build_ydl_opts(
         opts["ffmpeg_location"] = str(ffmpeg_path)
     if skip_download:
         opts["skip_download"] = True
+    if config is not None:
+        if config.js_runtime:
+            # Только quickjs: без него yt-dlp ищет deno и на публичных видео
+            # YouTube отдаёт ссылки, падающие с HTTP 403.
+            opts["js_runtimes"] = {"quickjs": {"path": str(config.js_runtime)}}
+        if config.cookies_file:
+            opts["cookiefile"] = str(Path(config.cookies_file).expanduser())
+        elif config.cookies_from_browser:
+            opts["cookiesfrombrowser"] = (config.cookies_from_browser,)
+        if config.youtube_client:
+            opts["extractor_args"] = {"youtube": {"player_client": [config.youtube_client]}}
     return opts
 
 
@@ -202,21 +266,38 @@ def summarize_info(info: dict[str, Any]) -> dict[str, Any]:
 
 
 def describe_error(exc: BaseException) -> tuple[str, str]:
-    """Превращает исключение в (код, понятный пользователю текст)."""
+    """Превращает исключение в (код, понятный пользователю текст).
+
+    Коды: bot_check, cookies, drm, forbidden, format_unavailable, unavailable,
+    permission, ffmpeg, network, generic, cancelled.
+    """
     if isinstance(exc, DownloadCancelled):
         return "cancelled", strings.ERRORS["cancelled"]
 
     detail = truncate(str(exc) or exc.__class__.__name__, 300)
     low = detail.lower()
 
-    if isinstance(exc, PermissionError) or any(marker in low for marker in _PERMISSION_MARKERS):
+    def has(markers: Iterable[str]) -> bool:
+        return any(marker in low for marker in markers)
+
+    if isinstance(exc, PermissionError) or has(_PERMISSION_MARKERS):
         return "permission", strings.ERRORS["permission"]
-    if any(marker in low for marker in _FFMPEG_MARKERS):
+    if has(_FFMPEG_MARKERS):
         return "ffmpeg", strings.ERRORS["ffmpeg"]
-    if any(marker in low for marker in _UNAVAILABLE_MARKERS):
+    if has(_BOT_MARKERS):
+        return "bot_check", strings.ERRORS["bot_check"]
+    if has(_COOKIE_MARKERS):
+        return "cookies", strings.ERRORS["cookies"]
+    if has(_DRM_MARKERS):
+        return "drm", strings.ERRORS["drm"]
+    if has(_FORMAT_MARKERS):
+        return "format_unavailable", strings.ERRORS["format_unavailable"]
+    if "http error 403" in low or "403: forbidden" in low:
+        return "forbidden", strings.ERRORS["forbidden"]
+    if has(_UNAVAILABLE_MARKERS):
         return "unavailable", strings.ERRORS["unavailable"]
-    if isinstance(exc, (URLError, socket.timeout, TimeoutError, ConnectionError)) or any(
-        marker in low for marker in _NETWORK_MARKERS
+    if isinstance(exc, (URLError, socket.timeout, TimeoutError, ConnectionError)) or has(
+        _NETWORK_MARKERS
     ):
         return "network", strings.ERRORS["network"]
     return "generic", strings.ERRORS["generic"].format(detail=detail)
@@ -302,18 +383,28 @@ class MetadataWorker(QThread):
         ffmpeg_path: str | Path | None = None,
         ydl_factory: Callable[[dict[str, Any]], Any] | None = None,
         parent: Any = None,
+        *,
+        config: YdlConfig | None = None,
     ) -> None:
         super().__init__(parent)
         self._url = url
         self._ffmpeg_path = ffmpeg_path
         self._ydl_factory = ydl_factory or yt_dlp.YoutubeDL
+        self._config = config or YdlConfig()
         log.debug("MetadataWorker создан для %s", url)
 
     def run(self) -> None:  # noqa: D401 - QThread API
         log.info("Проверка ссылки: %s", self._url)
         ydl = None
         try:
-            opts = build_ydl_opts(Path.cwd(), "best", self._ffmpeg_path, [], skip_download=True)
+            opts = build_ydl_opts(
+                Path.cwd(),
+                "best",
+                self._ffmpeg_path,
+                [],
+                skip_download=True,
+                config=self._config,
+            )
             ydl = self._ydl_factory(opts)
             info = ydl.extract_info(self._url, download=False)
             if not info:
@@ -356,6 +447,8 @@ class DownloadWorker(QThread):
         ffmpeg_path: str | Path | None = None,
         ydl_factory: Callable[[dict[str, Any]], Any] | None = None,
         parent: Any = None,
+        *,
+        config: YdlConfig | None = None,
     ) -> None:
         super().__init__(parent)
         self._url = url
@@ -363,6 +456,7 @@ class DownloadWorker(QThread):
         self._outdir = Path(outdir)
         self._ffmpeg_path = ffmpeg_path
         self._ydl_factory = ydl_factory or yt_dlp.YoutubeDL
+        self._config = config or YdlConfig()
         self._cancel_requested = False
         self._started_at = 0.0
         self._last_percent_logged = -10
@@ -392,15 +486,23 @@ class DownloadWorker(QThread):
         self._started_at = time.time()
         self._outdir.mkdir(parents=True, exist_ok=True)
         log.info(
-            "Старт загрузки: url=%s, качество=%s, папка=%s, ffmpeg=%s",
+            "Старт загрузки: url=%s, качество=%s, папка=%s, ffmpeg=%s, qjs=%s, cookies=%s",
             self._url,
             self._quality,
             self._outdir,
             self._ffmpeg_path or "не найден",
+            self._config.js_runtime or "не найден",
+            self._config.cookies_file or self._config.cookies_from_browser or "нет",
         )
         ydl = None
         try:
-            opts = build_ydl_opts(self._outdir, self._quality, self._ffmpeg_path, [self._hook])
+            opts = build_ydl_opts(
+                self._outdir,
+                self._quality,
+                self._ffmpeg_path,
+                [self._hook],
+                config=self._config,
+            )
             ydl = self._ydl_factory(opts)
             info = ydl.extract_info(self._url, download=True)
             if not isinstance(info, dict):

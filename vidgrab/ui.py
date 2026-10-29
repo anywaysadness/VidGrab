@@ -6,10 +6,10 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QByteArray, QSize, Qt
+from PySide6.QtCore import QByteArray, QSize, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
-    QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from vidgrab import APP_NAME, APP_VERSION, strings
-from vidgrab.downloader import DownloadWorker, MetadataWorker
+from vidgrab import APP_NAME, strings
+from vidgrab.downloader import DownloadWorker, MetadataWorker, YdlConfig
+from vidgrab.report import write_report
 from vidgrab.settings import Settings, save_settings
+from vidgrab.settings_dialog import SettingsDialog
 from vidgrab.theme import (
     ERROR,
     NORMAL,
@@ -37,19 +39,21 @@ from vidgrab.theme import (
     make_icon,
 )
 from vidgrab.utils import (
+    default_download_dir,
     ensure_writable_dir,
     find_ffmpeg,
+    find_quickjs,
     format_duration,
     format_quality_label,
     normalize_url,
     is_valid_url,
-    open_in_explorer,
+    open_folder,
 )
 
 log = logging.getLogger(__name__)
 
-MetadataFactory = Callable[[str, Path | None], Any]
-DownloadFactory = Callable[[str, str, Path, Path | None], Any]
+MetadataFactory = Callable[[str, Path | None, YdlConfig], Any]
+DownloadFactory = Callable[[str, str, Path, Path | None, YdlConfig], Any]
 
 
 class MainWindow(QMainWindow):
@@ -63,10 +67,12 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.settings = settings or Settings()
         self._metadata_factory: MetadataFactory = metadata_factory or (
-            lambda url, ffmpeg: MetadataWorker(url, ffmpeg)
+            lambda url, ffmpeg, config: MetadataWorker(url, ffmpeg, config=config)
         )
         self._download_factory: DownloadFactory = download_factory or (
-            lambda url, quality, outdir, ffmpeg: DownloadWorker(url, quality, outdir, ffmpeg)
+            lambda url, quality, outdir, ffmpeg, config: DownloadWorker(
+                url, quality, outdir, ffmpeg, config=config
+            )
         )
         self._titlebar_styled = False
         self._metadata_worker: Any = None
@@ -182,12 +188,17 @@ class MainWindow(QMainWindow):
         self.open_folder_btn = QPushButton(strings.BTN_OPEN_FOLDER)
         self.open_folder_btn.setIcon(make_icon("folder", "#e8ebf3"))
         self.open_folder_btn.setIconSize(QSize(18, 18))
-        self.open_folder_btn.setMinimumSize(QSize(190, 46))
-        self.open_folder_btn.setVisible(False)
+        self.open_folder_btn.setMinimumSize(QSize(180, 46))
+        self.settings_btn = QPushButton(strings.BTN_SETTINGS)
+        self.settings_btn.setMinimumSize(QSize(120, 46))
+        self.report_btn = QPushButton(strings.BTN_REPORT)
+        self.report_btn.setMinimumSize(QSize(96, 46))
         actions_row.addWidget(self.download_btn)
         actions_row.addWidget(self.cancel_btn)
         actions_row.addWidget(self.open_folder_btn)
         actions_row.addStretch(1)
+        actions_row.addWidget(self.settings_btn)
+        actions_row.addWidget(self.report_btn)
         layout.addLayout(actions_row)
 
         # Прогресс.
@@ -217,6 +228,26 @@ class MainWindow(QMainWindow):
         details_row.addStretch(1)
         layout.addLayout(details_row)
 
+        # Панель результата: имя файла и ссылка на папку. Живёт до следующей
+        # загрузки и не восстанавливается после перезапуска.
+        self.result_frame = QFrame()
+        self.result_frame.setObjectName("resultPanel")
+        result_layout = QHBoxLayout(self.result_frame)
+        result_layout.setContentsMargins(16, 12, 16, 12)
+        result_layout.setSpacing(16)
+        self.result_label = QLabel("")
+        self.result_label.setObjectName("resultLabel")
+        self.result_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.result_link = QLabel("")
+        self.result_link.setObjectName("resultLink")
+        self.result_link.setTextFormat(Qt.TextFormat.RichText)
+        self.result_link.setOpenExternalLinks(False)
+        self.result_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        result_layout.addWidget(self.result_label, 1)
+        result_layout.addWidget(self.result_link)
+        self.result_frame.setVisible(False)
+        layout.addWidget(self.result_frame)
+
         self.status_label = QLabel(strings.STATUS_IDLE)
         self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
@@ -242,6 +273,9 @@ class MainWindow(QMainWindow):
         self.download_btn.clicked.connect(self._on_download)
         self.cancel_btn.clicked.connect(self._on_cancel)
         self.open_folder_btn.clicked.connect(self._on_open_folder)
+        self.settings_btn.clicked.connect(self._on_settings)
+        self.report_btn.clicked.connect(self._on_report)
+        self.result_link.linkActivated.connect(self._on_result_link)
         self.url_edit.textEdited.connect(self._on_url_edited)
         self.quality_combo.currentTextChanged.connect(self._on_quality_changed)
 
@@ -301,6 +335,8 @@ class MainWindow(QMainWindow):
         self.quality_combo.setEnabled(idle and has_qualities)
         self.download_btn.setEnabled(idle and has_qualities and self._metadata is not None)
         self.cancel_btn.setEnabled(busy == "download")
+        self.settings_btn.setEnabled(idle)
+        # «Открыть папку» и «Отчёт» доступны всегда: они не мешают загрузке.
 
     def _reset_metadata(self) -> None:
         self._metadata = None
@@ -310,14 +346,59 @@ class MainWindow(QMainWindow):
         self.quality_combo.blockSignals(False)
         self.title_value.setText(strings.PLACEHOLDER_TITLE)
         self.duration_value.setText(strings.PLACEHOLDER_DURATION)
-        self.open_folder_btn.setVisible(False)
-        self._last_path = None
+        self._hide_result()
 
     def _reset_progress(self) -> None:
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.percent_label.setText("0%")
         self.speed_label.setText(strings.PLACEHOLDER_SPEED)
         self.eta_label.setText(strings.PLACEHOLDER_ETA)
+
+    def _folder_from_field(self) -> Path:
+        text = self.folder_edit.text().strip()
+        return Path(text).expanduser() if text else default_download_dir()
+
+    def _ydl_config(self) -> YdlConfig:
+        qjs = find_quickjs()
+        if qjs is None:
+            log.warning("qjs не найден: YouTube может отклонять загрузку (HTTP 403)")
+        return YdlConfig(
+            js_runtime=qjs,
+            cookies_from_browser=self.settings.cookies_from_browser,
+            cookies_file=self.settings.cookies_file,
+            youtube_client=self.settings.youtube_client,
+        )
+
+    def _show_result(self, path: str | Path) -> None:
+        target = Path(path)
+        self._last_path = target
+        self.result_label.setText(strings.RESULT_FILE.format(name=target.name))
+        self.result_label.setToolTip(str(target))
+        href = QUrl.fromLocalFile(str(target.parent)).toString()
+        self.result_link.setText(
+            f'<a href="{href}" style="color:#8bb8ff; text-decoration:none;">'
+            f"{strings.RESULT_OPEN_FOLDER}</a>"
+        )
+        self.result_frame.setVisible(True)
+
+    def _hide_result(self) -> None:
+        self._last_path = None
+        self.result_frame.setVisible(False)
+        self.result_label.setText("")
+        self.result_link.setText("")
+
+    def _open_folder_path(self, folder: Path) -> Path | None:
+        try:
+            opened = open_folder(folder)
+        except OSError as exc:
+            log.exception("Не удалось открыть папку %s", folder)
+            self._error(
+                strings.MSG_OPEN_FOLDER_FAILED.format(path=folder, detail=exc)
+            )
+            return None
+        log.info("Открыта папка: %s", opened)
+        return opened
 
     # ---------- действия ----------
 
@@ -368,7 +449,7 @@ class MainWindow(QMainWindow):
         self._set_busy("metadata")
         self.progress_bar.setRange(0, 0)
 
-        worker = self._metadata_factory(url, find_ffmpeg())
+        worker = self._metadata_factory(url, find_ffmpeg(), self._ydl_config())
         worker.ready.connect(self._on_metadata_ready)
         worker.failed.connect(self._on_metadata_failed)
         worker.finished.connect(self._on_metadata_finished)
@@ -405,8 +486,7 @@ class MainWindow(QMainWindow):
 
     def _on_metadata_failed(self, code: str, message: str) -> None:
         log.warning("Проверка ссылки не удалась: code=%s", code)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
+        self._reset_progress()
         self._set_busy(None)
         self._set_status(strings.STATUS_ERROR, error=True)
         self._error(message)
@@ -418,13 +498,40 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
 
     def _on_browse(self) -> None:
-        start = self.folder_edit.text().strip() or self.settings.last_folder
+        start = str(self._folder_from_field())
         chosen = QFileDialog.getExistingDirectory(self, strings.LABEL_FOLDER, start)
         if chosen:
             self.folder_edit.setText(chosen)
             self.settings.last_folder = chosen
             save_settings(self.settings)
             log.info("Выбрана папка сохранения: %s", chosen)
+
+    def _on_settings(self) -> None:
+        dialog = SettingsDialog(self.settings, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            save_settings(self.settings)
+            log.info("Настройки применены")
+
+    def _on_report(self) -> None:
+        try:
+            path = write_report(self.settings)
+        except Exception as exc:  # noqa: BLE001 - отчёт не должен ломать приложение
+            log.exception("Не удалось создать отчёт")
+            self._error(strings.REPORT_FAILED.format(detail=exc))
+            return
+
+        self._set_status(strings.STATUS_REPORT_DONE.format(path=path), ok=True)
+        box = QMessageBox(self)
+        box.setWindowTitle(strings.REPORT_TITLE)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(strings.REPORT_SAVED.format(path=path))
+        open_btn = box.addButton(
+            strings.REPORT_OPEN_FOLDER, QMessageBox.ButtonRole.ActionRole
+        )
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            self._open_folder_path(path.parent)
 
     def _on_download(self) -> None:
         if self._busy is not None:
@@ -441,8 +548,7 @@ class MainWindow(QMainWindow):
             self._warn(strings.MSG_NO_QUALITY)
             return
 
-        folder_text = self.folder_edit.text().strip() or self.settings.last_folder
-        folder = Path(folder_text).expanduser()
+        folder = self._folder_from_field()
         writable, reason = ensure_writable_dir(folder)
         if not writable:
             log.error("Папка недоступна для записи: %s (%s)", folder, reason)
@@ -457,13 +563,13 @@ class MainWindow(QMainWindow):
 
         self.folder_edit.setText(str(folder))
         self._reset_progress()
-        self.open_folder_btn.setVisible(False)
-        self._last_path = None
-        self.progress_bar.setRange(0, 100)
+        self._hide_result()
         self._set_status(strings.STATUS_DOWNLOADING)
         self._set_busy("download")
 
-        worker = self._download_factory(url, quality, folder, ffmpeg_path)
+        worker = self._download_factory(
+            url, quality, folder, ffmpeg_path, self._ydl_config()
+        )
         worker.progress.connect(self._on_progress)
         worker.stage_changed.connect(self._on_stage_changed)
         worker.completed.connect(self._on_completed)
@@ -481,6 +587,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось запустить загрузку")
             self._download_worker = None
+            self._reset_progress()
             self._set_busy(None)
             self._error(strings.ERRORS["generic"].format(detail=str(exc)))
 
@@ -495,29 +602,37 @@ class MainWindow(QMainWindow):
         self._set_status(text)
 
     def _on_completed(self, path: str) -> None:
-        self._last_path = Path(path)
         self.progress_bar.setValue(100)
         self.percent_label.setText("100%")
         self.speed_label.setText(strings.PLACEHOLDER_SPEED)
         self.eta_label.setText(strings.PLACEHOLDER_ETA)
         self._set_busy(None)
-        self.open_folder_btn.setVisible(True)
+        self._show_result(path)
         self._set_status(strings.STATUS_DONE.format(path=path), ok=True)
         self._save_settings()
         log.info("Интерфейс: загрузка завершена, файл %s", path)
 
     def _on_download_failed(self, code: str, message: str) -> None:
         self._set_busy(None)
+        self._reset_progress()
+        self._hide_result()
         self._set_status(strings.STATUS_ERROR, error=True)
         self._error(message)
+        if code == "bot_check":
+            answer = QMessageBox.question(
+                self,
+                strings.DIALOG_INFO_TITLE,
+                strings.MSG_BOT_CHECK_SETTINGS,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._on_settings()
 
     def _on_cancelled(self) -> None:
         self._set_busy(None)
-        self.progress_bar.setValue(0)
-        self.percent_label.setText("0%")
-        self.speed_label.setText(strings.PLACEHOLDER_SPEED)
-        self.eta_label.setText(strings.PLACEHOLDER_ETA)
-        self.open_folder_btn.setVisible(False)
+        self._reset_progress()
+        self._hide_result()
         self._set_status(strings.STATUS_CANCELLED, error=True)
 
     def _on_download_finished(self) -> None:
@@ -538,12 +653,19 @@ class MainWindow(QMainWindow):
             log.exception("Не удалось запросить отмену")
 
     def _on_open_folder(self) -> None:
-        target = self._last_path or Path(self.folder_edit.text().strip() or ".")
-        try:
-            open_in_explorer(target)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Не удалось открыть папку %s", target)
-            self._error(f"Не удалось открыть папку: {exc}")
+        """Всегда открывает папку из поля — независимо от последней загрузки."""
+        opened = self._open_folder_path(self._folder_from_field())
+        if opened is not None:
+            self.folder_edit.setText(str(opened))
+            self.settings.last_folder = str(opened)
+
+    def _on_result_link(self, _href: str = "") -> None:
+        """Клик по ссылке результата: папка файла, иначе папка загрузки."""
+        path = self._last_path
+        if path is not None and path.exists():
+            self._open_folder_path(path.parent)
+        else:
+            self._open_folder_path(self._folder_from_field())
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         worker = self._download_worker

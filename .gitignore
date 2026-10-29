@@ -10,6 +10,8 @@ __pycache__/
 # Локальные артефакты разработки
 .tmp/
 vidgrab/assets/ffmpeg.exe
+vidgrab/assets/ffprobe.exe
+vidgrab/assets/qjs.exe
 tools/*.zip
 tools/ffmpeg-*/
 
@@ -32,3 +34,4 @@ Thumbs.db
 tools/*.log
 tools/*.pid
 tools/ffmpeg-cache/
+tools/qjs-cache/

@@ -6,11 +6,7 @@ import argparse
 import faulthandler
 import json
 import logging
-import os
-import platform
-import subprocess
 import sys
-import tempfile
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -20,6 +16,7 @@ import yt_dlp
 
 from vidgrab import APP_NAME, APP_ORG, APP_VERSION, QUALITY_CHOICES, strings
 from vidgrab.downloader import (
+    YdlConfig,
     build_ydl_opts,
     describe_error,
     list_qualities,
@@ -28,13 +25,15 @@ from vidgrab.downloader import (
     resolve_download_path,
     summarize_info,
 )
-from vidgrab.settings import Settings, load_settings, save_settings
+from vidgrab.report import write_report
+from vidgrab.selftest import collect_selftest, write_selftest_json
+from vidgrab.settings import load_settings
 from vidgrab.utils import (
-    app_data_dir,
     crash_log_path,
     default_download_dir,
     ensure_writable_dir,
     find_ffmpeg,
+    find_quickjs,
     format_duration,
     is_valid_url,
     log_path,
@@ -103,112 +102,14 @@ def setup_logging() -> None:
 # --------------------------------------------------------------------------- #
 
 def run_selftest() -> int:
-    checks: dict[str, Any] = {}
-    errors: list[str] = []
-    result: dict[str, Any] = {
-        "app": APP_NAME,
-        "version": APP_VERSION,
-        "ok": False,
-        "python": sys.version.split()[0],
-        "frozen": bool(getattr(sys, "frozen", False)),
-        "executable": sys.executable,
-        "platform": platform.platform(),
-        "checks": checks,
-        "errors": errors,
-    }
-
-    data_dir = app_data_dir()
-    writable, reason = ensure_writable_dir(data_dir)
-    checks["appdata"] = {"path": str(data_dir), "writable": writable}
-    if not writable:
-        errors.append(f"каталог данных недоступен для записи: {reason}")
-
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix="vidgrab-selftest-", dir=str(data_dir) if writable else None
-        ) as tmp:
-            probe_path = Path(tmp) / "settings.json"
-            probe = Settings(last_folder=tmp, last_quality="720p")
-            saved = save_settings(probe, probe_path)
-            loaded = load_settings(probe_path)
-            checks["settings_roundtrip"] = bool(
-                saved and loaded.last_folder == tmp and loaded.last_quality == "720p"
-            )
-            if not checks["settings_roundtrip"]:
-                errors.append("настройки не сохраняются/не читаются")
-    except Exception as exc:  # noqa: BLE001
-        checks["settings_roundtrip"] = False
-        errors.append(f"settings: {exc}")
-
-    checks["log_file"] = str(log_path())
-    try:
-        log.info("selftest: проверка логирования")
-    except Exception as exc:  # noqa: BLE001
-        errors.append(f"логирование: {exc}")
-
-    checks["yt_dlp"] = getattr(yt_dlp.version, "__version__", "unknown")
-    try:
-        import certifi as _certifi
-
-        checks["certifi"] = _certifi.where()
-        checks["certifi_exists"] = Path(_certifi.where()).is_file()
-    except Exception:  # noqa: BLE001
-        checks["certifi"] = None
-        checks["certifi_exists"] = False
-    try:
-        import importlib
-
-        importlib.import_module("yt_dlp.extractor")  # ленивые экстракторы должны быть в сборке
-
-        checks["yt_dlp_extractors"] = True
-    except Exception as exc:  # noqa: BLE001
-        checks["yt_dlp_extractors"] = False
-        errors.append(f"yt-dlp extractors: {exc}")
-
-    try:
-        from PySide6 import __version__ as pyside_version
-        from PySide6.QtWidgets import QApplication
-
-        app = QApplication.instance() or QApplication([])
-        checks["pyside6"] = pyside_version
-        checks["qt_platform"] = app.platformName()
-    except Exception as exc:  # noqa: BLE001
-        checks["pyside6"] = None
-        errors.append(f"Qt: {exc}")
-
-    ffmpeg_path = find_ffmpeg()
-    checks["ffmpeg_path"] = str(ffmpeg_path) if ffmpeg_path else None
-    if not ffmpeg_path:
-        errors.append("ffmpeg не найден")
-    else:
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        try:
-            proc = subprocess.run(
-                [str(ffmpeg_path), "-version"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                creationflags=creationflags,
-            )
-            first_line = ""
-            output = (proc.stdout or "") + (proc.stderr or "")
-            if output.strip():
-                first_line = output.strip().splitlines()[0]
-            checks["ffmpeg_version"] = first_line
-            if proc.returncode != 0:
-                errors.append(f"ffmpeg вернул код {proc.returncode}")
-        except Exception as exc:  # noqa: BLE001
-            checks["ffmpeg_version"] = None
-            errors.append(f"ffmpeg не запускается: {exc}")
-
-    result["ok"] = not errors
-    report_path = data_dir / "selftest.json"
-    try:
-        report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        log.warning("Не удалось записать отчёт самопроверки", exc_info=True)
-
-    log.info("Самопроверка: %s (ошибок: %d)", "OK" if result["ok"] else "FAIL", len(errors))
+    result = collect_selftest()
+    write_selftest_json(result)
+    log.info(
+        "Самопроверка: %s (ошибок: %d, предупреждений: %d)",
+        "OK" if result["ok"] else "FAIL",
+        len(result.get("errors") or []),
+        len(result.get("warnings") or []),
+    )
     try:
         print(json.dumps(result, ensure_ascii=True, indent=2))
     except Exception:  # noqa: BLE001 - в windowed-сборке stdout может отсутствовать
@@ -220,8 +121,12 @@ def run_selftest() -> int:
 # CLI-прототип
 # --------------------------------------------------------------------------- #
 
-def _extract_metadata(url: str, ffmpeg_path: Path | None) -> dict[str, Any]:
-    opts = build_ydl_opts(Path.cwd(), "best", ffmpeg_path, [], skip_download=True)
+def _extract_metadata(
+    url: str, ffmpeg_path: Path | None, config: YdlConfig | None = None
+) -> dict[str, Any]:
+    opts = build_ydl_opts(
+        Path.cwd(), "best", ffmpeg_path, [], skip_download=True, config=config
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not isinstance(info, dict):
@@ -235,6 +140,7 @@ def _download_sync(
     outdir: Path,
     ffmpeg_path: Path | None,
     on_progress: Callable[[int, str, str], None] | None = None,
+    config: YdlConfig | None = None,
 ) -> Path:
     started_at = time.time()
 
@@ -246,7 +152,7 @@ def _download_sync(
         elif status == "finished" and on_progress is not None:
             on_progress(100, "—", "—")
 
-    opts = build_ydl_opts(outdir, quality, ffmpeg_path, [hook])
+    opts = build_ydl_opts(outdir, quality, ffmpeg_path, [hook], config=config)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -276,9 +182,19 @@ def _error_exit_code(code: str, *, stage: str) -> int:
     return EXIT_METADATA if stage == "metadata" else EXIT_DOWNLOAD
 
 
+def _cli_config(args: argparse.Namespace) -> YdlConfig:
+    return YdlConfig(
+        js_runtime=find_quickjs(),
+        cookies_from_browser=args.cookies_from_browser or "",
+        cookies_file=args.cookies or "",
+        youtube_client=args.youtube_client or "",
+    )
+
+
 def _cmd_cli(args: argparse.Namespace) -> int:
     url = normalize_url(args.url)
     machine = bool(args.json)
+    config = _cli_config(args)
 
     if not is_valid_url(url):
         message = strings.ERRORS["invalid_url"]
@@ -307,15 +223,16 @@ def _cmd_cli(args: argparse.Namespace) -> int:
         return EXIT_FFMPEG
 
     try:
-        summary = _extract_metadata(url, ffmpeg_path)
+        summary = _extract_metadata(url, ffmpeg_path, config)
     except Exception as exc:  # noqa: BLE001
         code, message = describe_error(exc)
         log.exception("CLI: не удалось получить метаданные")
+        exit_code = _error_exit_code(code, stage="metadata")
         if machine:
             _json_out({"ok": False, "code": code, "error": message})
         else:
             print(f"Ошибка: {message}", file=sys.stderr)
-        return _error_exit_code(code, stage="metadata")
+        return exit_code
 
     qualities = summary.get("qualities") or list_qualities({})
     if not machine:
@@ -324,6 +241,7 @@ def _cmd_cli(args: argparse.Namespace) -> int:
         print(f"Доступные качества: {', '.join(qualities)}")
         print(f"Папка сохранения: {outdir}")
         print(f"FFmpeg: {ffmpeg_path}")
+        print(f"QuickJS: {config.js_runtime or 'не найден'}")
 
     if args.quality not in qualities:
         message = (
@@ -334,7 +252,7 @@ def _cmd_cli(args: argparse.Namespace) -> int:
             _json_out(
                 {
                     "ok": False,
-                    "code": "unavailable",
+                    "code": "format_unavailable",
                     "error": message,
                     "qualities": qualities,
                     "title": summary.get("title"),
@@ -352,7 +270,7 @@ def _cmd_cli(args: argparse.Namespace) -> int:
         sys.stderr.flush()
 
     try:
-        path = _download_sync(url, args.quality, outdir, ffmpeg_path, on_progress)
+        path = _download_sync(url, args.quality, outdir, ffmpeg_path, on_progress, config)
     except KeyboardInterrupt:
         if not machine:
             sys.stderr.write("\nЗагрузка отменена пользователем.\n")
@@ -360,12 +278,13 @@ def _cmd_cli(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         code, message = describe_error(exc)
         log.exception("CLI: ошибка загрузки")
+        exit_code = _error_exit_code(code, stage="download")
         if machine:
             _json_out({"ok": False, "code": code, "error": message})
         else:
             sys.stderr.write("\n")
             print(f"Ошибка: {message}", file=sys.stderr)
-        return _error_exit_code(code, stage="download")
+        return exit_code
 
     if not machine:
         sys.stderr.write("\n")
@@ -445,7 +364,21 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--out", default=None, help="папка сохранения (по умолчанию Downloads/VidGrab)"
     )
     parser.add_argument("--json", action="store_true", help="машиночитаемый вывод (для --cli)")
+    parser.add_argument(
+        "--cookies-from-browser",
+        choices=["chrome", "edge", "firefox"],
+        default="",
+        help="брать cookies из браузера (для --cli)",
+    )
+    parser.add_argument("--cookies", default="", help="путь к cookies.txt (для --cli)")
+    parser.add_argument(
+        "--youtube-client",
+        choices=["", "web", "tv"],
+        default="",
+        help="клиент YouTube (по умолчанию авто)",
+    )
     parser.add_argument("--selftest", action="store_true", help="проверить установку и выйти")
+    parser.add_argument("--report", action="store_true", help="создать отчёт по логам и выйти")
     parser.add_argument("--version", action="store_true", help="показать версию и выйти")
     return parser
 
@@ -483,6 +416,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.version.split()[0],
         sys.argv[1:],
     )
+
+    if args.report:
+        try:
+            path = write_report(load_settings())
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Не удалось создать отчёт")
+            print(f"Ошибка: {strings.REPORT_FAILED.format(detail=exc)}", file=sys.stderr)
+            return EXIT_FAILURE
+        print(f"Отчёт создан: {path}")
+        return EXIT_OK
 
     if args.cli:
         if not args.url:
